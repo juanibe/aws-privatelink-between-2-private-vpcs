@@ -1,0 +1,630 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  PrivateLink lab - STEP 5 of 6.
+  Replicates the sample question: many VPCs reach ONE shared services VPC
+  with Network Load Balancer + PrivateLink. VPC A = provider, VPC B = consumer.
+
+# =====================================================================
+# LAB OVERVIEW - WHERE AM I?
+# ---------------------------------------------------------------------
+# Sample question: 200+ VPCs must reach ONE shared services VPC with the
+# least overhead. Correct answer: Network Load Balancer + PrivateLink.
+# We build a mini version: 1 consumer VPC instead of 200. Same mechanism.
+#
+# What is PrivateLink?
+#   A way to PUBLISH ONE SERVICE from a VPC so other VPCs can use it
+#   privately, WITHOUT connecting the networks.
+#   Analogy: a shop counter. The consumer asks for the one service at the
+#   counter, but cannot walk into the warehouse (the rest of VPC A).
+#   - Provider side (VPC A): service behind a Network Load Balancer,
+#     published as an ENDPOINT SERVICE.
+#   - Consumer side (VPC B): an INTERFACE ENDPOINT = a private IP inside
+#     VPC B that leads to that service.
+#   No routes, no peering, overlapping CIDRs are fine.
+#
+#  VPC B (consumer) 10.0.0.0/16          VPC A (provider) 10.0.0.0/16
+#  +------------------------+            +------------------------------+
+#  | Test EC2 --> Interface |  Private   | Endpoint --> NLB --> EC2     |
+#  | (curl)       endpoint  |---Link---->| service          "Hello..."  |
+#  +------------------------+            +------------------------------+
+#     Step 6      Step 5                   Step 4     Step 3   Step 2
+#
+# Progress:
+#   [x] 1 Two VPCs (same CIDR)
+#   [x] 2 "Shared service" EC2 in VPC A
+#   [x] 3 Internal NLB in front of it
+#   [x] 4 Endpoint service (provider side)
+#   [x] 5 Interface endpoint in VPC B (consumer side)  <-- THIS VERSION
+#   [ ] 6 Test with curl from VPC B
+#
+# How will we CALL the shared service? (Step 6)
+#   From a test EC2 in VPC B:   curl http://<endpoint-DNS-name>
+#
+#   Test EC2 --> Endpoint ENI ==PrivateLink==> NLB --> Shared service EC2
+#   (VPC B)      (VPC B IP)                    (VPC A)  port 80
+#
+#   1. Step 5 creates the interface endpoint: AWS puts a network interface
+#      (ENI) in each VPC B subnet, with a private IP FROM VPC B.
+#   2. AWS gives the endpoint a DNS name automatically, e.g.
+#      vpce-0abc123.vpce-svc-0def456.eu-west-1.vpce.amazonaws.com
+#      It resolves to those private IPs in VPC B.
+#   3. curl hits that IP -> PrivateLink -> NLB in VPC A -> instance:80.
+#   - The consumer never uses VPC A's IPs, only IPs in ITS OWN VPC.
+#     That's why overlapping CIDRs don't matter.
+#   - The consumer reaches ONLY this service, not the rest of VPC A.
+#   - Only the consumer can START the connection.
+#
+# How is the DNS name created?
+#   - Default: you create nothing. AWS generates the vpce-... name when
+#     the interface endpoint is created.
+#   - Friendly name (real world), e.g. shared.mycompany.com, two ways:
+#     a) Provider sets a PRIVATE DNS NAME on the endpoint service and
+#        proves domain ownership (TXT record in public DNS). Consumers
+#        enable "private DNS" on their endpoint and the name just works.
+#     b) Consumer creates its own Route 53 PRIVATE HOSTED ZONE with a
+#        record pointing to the endpoint's DNS name.
+#
+# Do we need SSL/TLS?
+#   - For PrivateLink to work: NO. Traffic stays on the AWS network and
+#     never touches the internet. This lab uses plain HTTP to stay simple.
+#   - For production: YES, recommended. SEC09-BP02 "Enforce encryption in
+#     transit". Two options:
+#     a) TLS listener on the NLB with an ACM certificate (NLB offloads
+#        encryption, see PERF05 load balancing + encryption offloading).
+#        SEC09-BP01: use ACM to manage and auto-renew certificates.
+#     b) TCP 443 pass-through: the instance itself handles TLS.
+#   - The certificate must match the name clients use, so in practice you
+#     pair TLS with a friendly private DNS name (not the vpce-... name).
+#
+# CLI commands (run from the folder with this file):
+#   Validate: aws cloudformation validate-template --template-body file://privatelink-lab.yaml
+#   Deploy:   aws cloudformation deploy --template-file privatelink-lab.yaml --stack-name privatelink-lab
+#             (creates the stack the 1st time, UPDATES it in later steps)
+#   Preview:  add --no-execute-changeset to see what will change first
+#   Status:   aws cloudformation describe-stacks --stack-name privatelink-lab --query "Stacks[0].StackStatus"
+#   Outputs:  aws cloudformation describe-stacks --stack-name privatelink-lab --query "Stacks[0].Outputs" --output table
+#   Errors:   aws cloudformation describe-stack-events --stack-name privatelink-lab
+#               --query "StackEvents[?contains(ResourceStatus,'FAILED')].[LogicalResourceId,ResourceStatusReason]" --output table
+#   Cleanup:  aws cloudformation delete-stack --stack-name privatelink-lab
+#             aws cloudformation wait stack-delete-complete --stack-name privatelink-lab
+#   Well-Architected: Operational Excellence "make frequent, small,
+#   reversible changes" (change-set preview, one-command delete) and
+#   Cost Optimization (no forgotten resources).
+# =====================================================================
+
+# =====================================================================
+# STEP 1 - CREATE THE TWO VPCs
+# ---------------------------------------------------------------------
+# What this step creates (all free, no cost):
+#   - ProviderVPC (VPC A)  10.0.0.0/16  -> shared services
+#       - 2 subnets: 10.0.1.0/24 (AZ1), 10.0.2.0/24 (AZ2)
+#   - ConsumerVPC (VPC B)  10.0.0.0/16  -> the "country account" VPC
+#       - 2 subnets: same CIDRs as VPC A, one per AZ
+#
+# Why the SAME CIDR in both VPCs?
+#   On purpose. VPC peering would be refused because the CIDRs overlap.
+#   PrivateLink does not care about overlapping CIDRs. This lab proves it.
+#
+# Are the subnets private? YES, both VPCs are fully private:
+#   - We created no route table, so every subnet uses the VPC's MAIN
+#     route table, which has only one route:  10.0.0.0/16 -> local
+#     ("local" = traffic only inside the same VPC).
+#   - A subnet is "public" only with 0.0.0.0/0 -> Internet Gateway.
+#     There is no Internet Gateway, so no internet in either direction.
+#   - The two VPCs can't talk to each other either. PrivateLink will
+#     solve that later WITHOUT adding any route.
+#   Check: aws ec2 describe-route-tables --filters "Name=vpc-id,Values=<VpcId>"
+#            --query "RouteTables[].Routes[]" --output table
+#
+# Well-Architected links:
+#   - Operational Excellence, "Perform operations as code": the whole lab
+#     lives in one template, so you can recreate or delete it in one action.
+#   - REL02-BP03 (IP subnet allocation accounts for expansion and
+#     availability): subnets spread across multiple AZs, /16 leaves room.
+#   - SEC05-BP01 / SEC05-BP02 (network layers, control traffic at all
+#     layers): private by default, open only the exact paths you need.
+# =====================================================================
+
+# =====================================================================
+# STEP 2 - THE "SHARED SERVICE" EC2 INSTANCE IN VPC A
+# ---------------------------------------------------------------------
+# What this step adds:
+#   - LatestAmiId parameter: always the newest Amazon Linux 2023 image
+#   - ServiceSecurityGroup: allows TCP 80 only from VPC A's CIDR
+#   - ServiceInstance: t3.micro that answers "Hello from shared services"
+#
+# Cost: t3.micro is billed per hour (Free Tier eligible on new accounts).
+#
+# Why allow port 80 from VPC A's CIDR (10.0.0.0/16) and not from VPC B?
+#   With PrivateLink the instance never sees VPC B. Traffic arrives from
+#   the NLB's PRIVATE IPs inside VPC A (plus the NLB health checks).
+#   So the instance only needs to trust its own VPC. VPC B's CIDR is
+#   irrelevant here (and it's the same range anyway!).
+#
+# The instance has no internet access. That's fine: python3 is already
+# installed in Amazon Linux 2023, so the web server needs no downloads.
+#
+# Deploy: same "deploy" command. CloudFormation only ADDS the new
+# resources; the VPCs stay untouched (check it with --no-execute-changeset).
+#
+# Well-Architected links:
+#   - SEC05-BP02 (control traffic at all layers): security group opens
+#     only one port (80) to only one source (the VPC).
+#   - SEC06 (protect compute): no public IP, no SSH port, no internet.
+# =====================================================================
+
+# =====================================================================
+# STEP 3 - INTERNAL NETWORK LOAD BALANCER (NLB) IN FRONT OF THE SERVICE
+# ---------------------------------------------------------------------
+# What this step adds:
+#   - ServiceTargetGroup: "who receives the traffic" -> our EC2, TCP 80
+#   - ServiceNLB:         internal NLB in BOTH VPC A subnets (2 AZs)
+#   - ServiceListener:    "what the NLB listens on" -> TCP 80, forwards
+#                         to the target group
+#   Load balancer = Listener (port) -> Target group (targets + health check)
+#
+# Cost: the NLB is billed PER HOUR (+ usage). Delete the stack when done.
+#
+# Does an NLB open the VPC to the internet? NO, not if it's INTERNAL:
+#   Scheme            Gets          Reachable from
+#   internet-facing   public IPs    the internet (needs Internet Gateway)
+#   internal          private IPs   inside the VPC (+ through PrivateLink)
+#   We use Scheme: internal. And VPC A has no Internet Gateway anyway.
+#   Two layers of protection. The only way in will be the endpoint
+#   service (Step 4), only for principals we allow.
+#
+# Why NLB and not ALB?
+#   - PrivateLink endpoint services ONLY accept a Network Load Balancer
+#     (or a Gateway Load Balancer for appliances). You can't pick an ALB.
+#   - PrivateLink works at LAYER 4 (TCP/UDP), it just forwards
+#     connections. NLB = layer 4. ALB = layer 7 (HTTP: paths, headers),
+#     which PrivateLink doesn't need.
+#   - Need ALB features? Put the ALB BEHIND the NLB:
+#     NLB -> target group of type "alb" -> ALB.
+#   EXAM TIP: "expose a service to other VPCs/accounts with PrivateLink"
+#   -> NLB. An option with ALB as the endpoint service -> wrong.
+#
+# In what VPC is the NLB? VPC A (provider).
+#   Subnets = ProviderSubnet1 + ProviderSubnet2 -> one NLB node per AZ of
+#   VPC A, with private IPs 10.0.1.x and 10.0.2.x.
+#   The NLB always lives NEXT TO THE SERVICE it fronts (provider side).
+#   The consumer side never gets an NLB, only an interface endpoint.
+#   Provider builds ONE NLB, ONE time; each of the 200+ consumer VPCs
+#   just adds an endpoint. Nothing changes in VPC A per new consumer.
+#   REL02-BP04: prefer hub-and-spoke over many-to-many mesh
+#   (VPC A = hub, every consumer = spoke).
+#
+# Why CROSS-ZONE load balancing = true?
+#   Our only instance is in AZ1. The NLB has a node in AZ1 and AZ2.
+#   With cross-zone OFF (NLB default), the AZ2 node only sends to targets
+#   in AZ2 -> there are none -> requests entering through AZ2 fail.
+#   With PrivateLink this matters: the consumer endpoint in AZ2 talks to
+#   the NLB node in AZ2. Cross-zone ON lets every node reach every target.
+#   (Real world: put targets in EVERY AZ instead. Cross-zone on NLB can
+#   add inter-AZ data transfer charges.)
+#
+# Check the target is healthy after deploying (wait ~1 minute):
+#   aws elbv2 describe-target-health --target-group-arn <ServiceTargetGroupArn>
+#     --query "TargetHealthDescriptions[].TargetHealth.State"
+#   -> "healthy" means: NLB can reach the instance on port 80.
+#   If "unhealthy": check the security group allows TCP 80 from 10.0.0.0/16.
+#
+# Well-Architected links:
+#   - REL02-BP01 / REL10 (high availability, multiple AZs): NLB spans
+#     2 AZs. Single instance is a lab shortcut; production = targets in
+#     each AZ (ideally an Auto Scaling group).
+#   - PERF05 (use load balancing): NLB recommended for layer 4 (TCP/UDP),
+#     extreme performance and low latency; ALB for HTTP.
+#   - SEC05-BP02 (control traffic at all layers): internal scheme, no
+#     internet path.
+# =====================================================================
+
+# =====================================================================
+# STEP 4 - ENDPOINT SERVICE (provider side) = PrivateLink starts here
+# ---------------------------------------------------------------------
+# What this step adds:
+#   - EndpointService:            publishes the NLB as a PrivateLink
+#                                 "endpoint service" (the shop counter)
+#   - EndpointServicePermissions: WHO may connect (allowed principals)
+#
+# Cost: the endpoint service itself is FREE for the provider. The
+# consumer pays for its interface endpoint (Step 5), per hour + per GB.
+#
+# Mapping to the sample question (option 3):
+#   "Network Load Balancer across the AZs"      -> Step 3 (ServiceNLB)
+#   "Create service consumer roles in IAM"      -> AllowedPrincipals
+#   "Set endpoint connection acceptance to
+#    automatically accept"                      -> AcceptanceRequired: false
+#   "Create consumer endpoint in each VPC"      -> Step 5
+#
+# Two gates control who can connect:
+#   1. ALLOWED PRINCIPALS (permission): which AWS accounts / roles / users
+#      can even SEE and request a connection. Here: our own account
+#      (arn:aws:iam::<account-id>:root = any IAM identity in that account
+#      that has the IAM permission to create endpoints).
+#      Cross-account: add arn:aws:iam::<other-account-id>:root.
+#      NEVER use "*" (anyone in AWS could request a connection).
+#   2. ACCEPTANCE REQUIRED (approval):
+#      true  -> provider must manually approve each connection request
+#      false -> allowed principals are connected automatically
+#      With 200+ VPCs in trusted accounts, manual approval = overhead,
+#      so the question picks automatic acceptance. Safe because gate 1
+#      already limits WHO can ask.
+#
+# The SERVICE NAME (Output EndpointServiceName) looks like:
+#   com.amazonaws.vpce.<region>.vpce-svc-0123456789abcdef0
+#   This is what consumers use to find and connect to the service.
+#   It's like the shop's address: share it with consumer accounts.
+#
+# Check after deploying:
+#   aws ec2 describe-vpc-endpoint-service-configurations
+#     --query "ServiceConfigurations[].[ServiceName,ServiceState,AcceptanceRequired]" --output table
+#   aws ec2 describe-vpc-endpoint-service-permissions --service-id <EndpointServiceId>
+#   -> ServiceState "Available", AcceptanceRequired False, your account listed.
+#
+# Still nothing connects yet: no consumer has created an endpoint.
+# The provider can't "push" a connection into VPC B. Only the consumer
+# can start it (Step 5).
+#
+# Well-Architected links:
+#   - SEC05-BP02: PrivateLink -> private access to services in other VPCs,
+#     only the CONSUMER can initiate the connection.
+#   - SEC03 (grant least privilege): allowed principals = only the
+#     accounts that need the service, never "*".
+#   - REL02-BP04 (hub-and-spoke): one endpoint service, many consumers.
+#   - Operational Excellence: automatic acceptance removes a manual step
+#     per consumer (least operational overhead).
+# =====================================================================
+
+# =====================================================================
+# STEP 5 - INTERFACE ENDPOINT IN VPC B (consumer side)
+# ---------------------------------------------------------------------
+# What this step adds:
+#   - EndpointSecurityGroup: firewall on the endpoint ENIs in VPC B,
+#                            allows TCP 80 from VPC B's clients
+#   - ConsumerEndpoint:      the interface endpoint = the consumer's
+#                            "door" to the shared service
+#
+# Cost: interface endpoint is billed PER HOUR PER AZ + per GB processed.
+#
+# What AWS creates for you:
+#   - One ENI (network interface) in EACH subnet you list (AZ1 + AZ2),
+#     each with a private IP FROM VPC B (e.g. 10.0.1.x, 10.0.2.x).
+#   - DNS names that resolve to those IPs:
+#       vpce-xxx.vpce-svc-yyy.<region>.vpce.amazonaws.com        (regional)
+#       vpce-xxx-<az>.vpce-svc-yyy.<region>.vpce.amazonaws.com   (per AZ)
+#     Output EndpointDnsName = the regional one -> use it in Step 6.
+#
+# Key properties:
+#   - ServiceName: the "address" from Step 4 (com.amazonaws.vpce...).
+#     In a real multi-account setup the consumer gets it from the
+#     provider and pastes it here.
+#   - VpcEndpointType: Interface (ENIs with private IPs). The other type,
+#     "Gateway", only exists for S3 and DynamoDB (route table entries).
+#   - PrivateDnsEnabled: false. We didn't set a private DNS name on the
+#     endpoint service, so there's nothing to enable. We'll use the
+#     AWS-generated vpce-... name.
+#   - Two subnets = two AZs -> if one AZ fails, the other ENI still works.
+#
+# Why "DependsOn: EndpointServicePermissions"?
+#   CloudFormation creates resources in parallel when it can. If the
+#   endpoint is created BEFORE our account is added to allowed principals,
+#   the request is rejected. DependsOn forces the right order:
+#   permissions first, endpoint second.
+#   (Real cross-account world: the provider grants permission, THEN the
+#   consumer creates its endpoint in its own account/stack.)
+#
+# Why does the endpoint need a SECURITY GROUP?
+#   The endpoint is an ENI in VPC B, and every ENI has a security group.
+#   It controls WHO IN VPC B can use the endpoint. Here: TCP 80 from
+#   VPC B's CIDR. You could narrow it to only the client SG.
+#   Notice: there are now TWO security groups on the path:
+#     VPC B: EndpointSecurityGroup (who can use the door)
+#     VPC A: ServiceSecurityGroup  (NLB -> instance)
+#
+# Still no route table was touched! The endpoint IPs are INSIDE VPC B,
+# so the "local" route already reaches them.
+#
+# Check after deploying:
+#   aws ec2 describe-vpc-endpoints --vpc-endpoint-ids <ConsumerEndpointId>
+#     --query "VpcEndpoints[].[State,NetworkInterfaceIds]"
+#   -> State "available" (if "pendingAcceptance": acceptance is required;
+#      if it fails: check allowed principals in Step 4)
+#   aws ec2 describe-vpc-endpoint-connections
+#     --query "VpcEndpointConnections[].[VpcEndpointId,VpcEndpointState]"
+#   -> provider's view: the connection shows as "available" (auto-accepted)
+#
+# Well-Architected links:
+#   - SEC05-BP02: the consumer INITIATES the connection; a security group
+#     controls which clients can use the endpoint.
+#   - REL10 (fault isolation, multiple AZs): endpoint ENIs in 2 AZs.
+#   - REL02-BP04 (hub-and-spoke): for 200 VPCs, repeat ONLY this step.
+# =====================================================================
+
+Parameters:
+  # Reads the latest AL2023 AMI ID from AWS Systems Manager Parameter Store.
+  # No hard-coded AMI IDs (they differ per Region and get outdated).
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+Resources:
+  # ---------------------------------------------------------------
+  # STEP 1 - VPC A - PROVIDER (shared services)
+  # ---------------------------------------------------------------
+  ProviderVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      # DNS support + hostnames: needed later so the endpoint's
+      # DNS name resolves inside the VPCs.
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: vpc-a-provider
+
+  ProviderSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref ProviderVPC
+      CidrBlock: 10.0.1.0/24
+      # !GetAZs '' lists the AZs of the Region you deploy in.
+      # !Select [0, ...] picks the 1st one. No hard-coded AZ names,
+      # so the template works in any Region.
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: vpc-a-subnet-az1
+
+  ProviderSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref ProviderVPC
+      CidrBlock: 10.0.2.0/24
+      # 2nd AZ -> resources spread across AZs (reliability, REL02-BP03)
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: vpc-a-subnet-az2
+
+  # ---------------------------------------------------------------
+  # STEP 1 - VPC B - CONSUMER
+  # SAME CIDR as VPC A on purpose: peering would fail here,
+  # PrivateLink will work.
+  # ---------------------------------------------------------------
+  ConsumerVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      # Needed so the interface endpoint DNS name resolves in VPC B
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: vpc-b-consumer
+
+  ConsumerSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref ConsumerVPC
+      CidrBlock: 10.0.1.0/24 # overlaps with VPC A on purpose
+      AvailabilityZone: !Select [0, !GetAZs ""] # 1st AZ
+      Tags:
+        - Key: Name
+          Value: vpc-b-subnet-az1
+
+  ConsumerSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref ConsumerVPC
+      CidrBlock: 10.0.2.0/24 # overlaps with VPC A on purpose
+      AvailabilityZone: !Select [1, !GetAZs ""] # 2nd AZ
+      Tags:
+        - Key: Name
+          Value: vpc-b-subnet-az2
+
+  # ---------------------------------------------------------------
+  # STEP 2 - SECURITY GROUP for the shared service
+  # Security group = stateful firewall around the instance.
+  # Inbound: only TCP 80 from VPC A (where the NLB lives).
+  # Outbound: default (all allowed); replies are allowed automatically
+  # because security groups are stateful.
+  # ---------------------------------------------------------------
+  ServiceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Shared service - HTTP from VPC A only (NLB + health checks)
+      VpcId: !Ref ProviderVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 10.0.0.0/16 # VPC A CIDR -> NLB private IPs live here
+      Tags:
+        - Key: Name
+          Value: sg-shared-service
+
+  # ---------------------------------------------------------------
+  # STEP 2 - THE SHARED SERVICE (EC2 instance)
+  # A tiny web server that answers "Hello from shared services".
+  # In the real scenario this would be DNS, logging, auth, etc.
+  # ---------------------------------------------------------------
+  ServiceInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAmiId # latest Amazon Linux 2023
+      InstanceType: t3.micro
+      SubnetId: !Ref ProviderSubnet1 # private subnet in AZ1, no public IP
+      SecurityGroupIds:
+        - !Ref ServiceSecurityGroup
+      # User data = script that runs once at first boot (as root).
+      # !Base64 is required: EC2 expects user data base64-encoded.
+      #   1. writes the page content to /index.html
+      #   2. starts python's built-in web server on port 80, in background (&)
+      UserData: !Base64 |
+        #!/bin/bash
+        echo "Hello from shared services" > /index.html
+        cd / && python3 -m http.server 80 &
+      Tags:
+        - Key: Name
+          Value: shared-service-ec2
+
+  # ---------------------------------------------------------------
+  # STEP 3 - TARGET GROUP: who receives the traffic + health check
+  # ---------------------------------------------------------------
+  ServiceTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: tg-shared-service
+      VpcId: !Ref ProviderVPC
+      Protocol: TCP # layer 4, matches the NLB
+      Port: 80
+      TargetType: instance # targets are EC2 instance IDs
+      Targets:
+        - Id: !Ref ServiceInstance # our shared service from Step 2
+          Port: 80
+      # Health check: NLB opens a TCP connection to port 80.
+      # Faster settings than default so the lab doesn't make you wait.
+      HealthCheckProtocol: TCP
+      HealthCheckIntervalSeconds: 10
+      HealthyThresholdCount: 2 # 2 successes -> healthy
+      UnhealthyThresholdCount: 2 # 2 failures  -> unhealthy
+
+  # ---------------------------------------------------------------
+  # STEP 3 - THE NETWORK LOAD BALANCER (internal, 2 AZs)
+  # ---------------------------------------------------------------
+  ServiceNLB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: nlb-shared-service
+      Type: network # NLB (layer 4). PrivateLink needs this
+      Scheme: internal # private IPs only, NO internet
+      Subnets: # one NLB node per AZ
+        - !Ref ProviderSubnet1
+        - !Ref ProviderSubnet2
+      LoadBalancerAttributes:
+        # Lets the AZ2 node send to the target in AZ1 (see Step 3 notes)
+        - Key: load_balancing.cross_zone.enabled
+          Value: "true"
+      Tags:
+        - Key: Name
+          Value: nlb-shared-service
+
+  # ---------------------------------------------------------------
+  # STEP 3 - LISTENER: what the NLB listens on, and where it forwards
+  # ---------------------------------------------------------------
+  ServiceListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ServiceNLB
+      Protocol: TCP
+      Port: 80
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ServiceTargetGroup
+
+  # ---------------------------------------------------------------
+  # STEP 4 - ENDPOINT SERVICE: publish the NLB through PrivateLink
+  # ---------------------------------------------------------------
+  EndpointService:
+    Type: AWS::EC2::VPCEndpointService
+    Properties:
+      NetworkLoadBalancerArns: # must be an NLB (or GWLB), never ALB
+        - !Ref ServiceNLB
+      AcceptanceRequired: false # gate 2: auto-accept connections
+      Tags:
+        - Key: Name
+          Value: shared-services-endpoint-service
+
+  # ---------------------------------------------------------------
+  # STEP 4 - PERMISSIONS: who may connect (gate 1, least privilege)
+  # = "service consumer roles" in the sample question
+  # ---------------------------------------------------------------
+  EndpointServicePermissions:
+    Type: AWS::EC2::VPCEndpointServicePermissions
+    Properties:
+      ServiceId: !Ref EndpointService
+      AllowedPrincipals:
+        # Our own account. !Sub inserts the account ID automatically.
+        # Cross-account: add one line per consumer account.
+        - !Sub arn:aws:iam::${AWS::AccountId}:root
+
+  # ---------------------------------------------------------------
+  # STEP 5 - SECURITY GROUP on the endpoint ENIs (VPC B)
+  # Who in VPC B may use the endpoint: TCP 80 from VPC B's CIDR.
+  # ---------------------------------------------------------------
+  EndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Interface endpoint - HTTP from VPC B clients
+      VpcId: !Ref ConsumerVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 10.0.0.0/16 # VPC B CIDR (the test EC2 lives here)
+      Tags:
+        - Key: Name
+          Value: sg-consumer-endpoint
+
+  # ---------------------------------------------------------------
+  # STEP 5 - INTERFACE ENDPOINT: the consumer's door to the service
+  # ---------------------------------------------------------------
+  ConsumerEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    # Permissions must exist BEFORE the endpoint asks to connect
+    DependsOn: EndpointServicePermissions
+    Properties:
+      VpcEndpointType: Interface # ENIs with private IPs in VPC B
+      # The "address" published in Step 4
+      ServiceName: !Sub com.amazonaws.vpce.${AWS::Region}.${EndpointService}
+      VpcId: !Ref ConsumerVPC
+      SubnetIds: # one ENI per subnet = per AZ
+        - !Ref ConsumerSubnet1
+        - !Ref ConsumerSubnet2
+      SecurityGroupIds:
+        - !Ref EndpointSecurityGroup
+      PrivateDnsEnabled: false # no custom private DNS name on the service
+
+# Outputs: shown in the stack's Outputs tab / describe-stacks
+Outputs:
+  ProviderVpcId:
+    Description: VPC A (provider / shared services)
+    Value: !Ref ProviderVPC
+  ConsumerVpcId:
+    Description: VPC B (consumer)
+    Value: !Ref ConsumerVPC
+  ServiceInstanceId:
+    Description: Shared service EC2 instance (Step 2)
+    Value: !Ref ServiceInstance
+  ServicePrivateIp:
+    Description: Private IP of the shared service (only reachable inside VPC A)
+    Value: !GetAtt ServiceInstance.PrivateIp
+  ServiceNlbArn:
+    Description: Internal NLB ARN (Step 3) - used by the endpoint service in Step 4
+    Value: !Ref ServiceNLB
+  ServiceNlbDnsName:
+    Description: Internal NLB DNS name (resolves to private IPs in VPC A only)
+    Value: !GetAtt ServiceNLB.DNSName
+  ServiceTargetGroupArn:
+    Description: Target group ARN (Step 3) - use it to check target health
+    Value: !Ref ServiceTargetGroup
+  EndpointServiceId:
+    Description: Endpoint service ID (Step 4)
+    Value: !Ref EndpointService
+  EndpointServiceName:
+    Description: Service name consumers use to connect (Step 4) - the "address"
+    Value: !Sub com.amazonaws.vpce.${AWS::Region}.${EndpointService}
+  ConsumerEndpointId:
+    Description: Interface endpoint ID in VPC B (Step 5)
+    Value: !Ref ConsumerEndpoint
+  EndpointDnsName:
+    Description: Regional DNS name of the endpoint - use it with curl in Step 6
+    # DnsEntries = list of "hostedZoneId:dnsName". 1st entry = regional name.
+    # Split on ":" and take the 2nd part (the DNS name).
+    Value:
+      !Select [
+        1,
+        !Split [":", !Select [0, !GetAtt ConsumerEndpoint.DnsEntries]],
+      ]
