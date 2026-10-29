@@ -3,7 +3,7 @@
 Hands-on lab for the **AWS Certified Solutions Architect – Associate** exam.
 It rebuilds a real exam scenario with **CloudFormation**, step by step, and links every decision to the **AWS Well-Architected Framework**.
 
-> **Status:** Steps 1–4 done (provider side). Steps 5–6 (consumer side + test) coming next.
+> **Status:** ✅ Complete. All 6 steps built and tested: `curl` from VPC B returns `Hello from shared services` through PrivateLink.
 
 ---
 
@@ -16,9 +16,10 @@ It rebuilds a real exam scenario with **CloudFormation**, step by step, and link
 5. [Step-by-step build](#5-step-by-step-build)
 6. [CLI commands](#6-cli-commands)
 7. [FAQ](#7-faq)
-8. [Well-Architected mapping](#8-well-architected-mapping)
-9. [Exam tips](#9-exam-tips)
-10. [Cost and cleanup](#10-cost-and-cleanup)
+8. [Troubleshooting](#8-troubleshooting)
+9. [Well-Architected mapping](#9-well-architected-mapping)
+10. [Exam tips](#10-exam-tips)
+11. [Cost and cleanup](#11-cost-and-cleanup)
 
 ---
 
@@ -59,6 +60,7 @@ A way to **publish one service** from a VPC so other VPCs can use it **privately
 ```mermaid
 flowchart LR
   subgraph B["VPC B (consumer) 10.0.0.0/16"]
+    U["You (browser / CLI)"] -. "SSH via IAM" .-> EIC["EC2 Instance<br/>Connect Endpoint"] -.-> T
     T["Test EC2<br/>curl"] --> E["Interface endpoint<br/>(ENI, VPC B IP)"]
   end
   subgraph A["VPC A (provider) 10.0.0.0/16"]
@@ -69,14 +71,14 @@ flowchart LR
 
 Both VPCs use the **same CIDR (10.0.0.0/16) on purpose**. VPC peering would be refused, but PrivateLink works fine.
 
-| Step | What                                         | Where | Status |
-| ---- | -------------------------------------------- | ----- | ------ |
-| 1    | Two VPCs, same CIDR, 2 subnets each in 2 AZs | Both  | ✅     |
-| 2    | "Shared service" EC2 + security group        | VPC A | ✅     |
-| 3    | Internal NLB + target group + listener       | VPC A | ✅     |
-| 4    | Endpoint service + allowed principals        | VPC A | ✅     |
-| 5    | Interface endpoint                           | VPC B | ⬜     |
-| 6    | Test EC2 + `curl`                            | VPC B | ⬜     |
+| Step | What                                              | Where | Status |
+| ---- | ------------------------------------------------- | ----- | ------ |
+| 1    | Two VPCs, same CIDR, 2 subnets each in 2 AZs      | Both  | ✅     |
+| 2    | "Shared service" EC2 + security group             | VPC A | ✅     |
+| 3    | Internal NLB + target group + listener            | VPC A | ✅     |
+| 4    | Endpoint service + allowed principals             | VPC A | ✅     |
+| 5    | Interface endpoint + security group               | VPC B | ✅     |
+| 6    | Test EC2 + EC2 Instance Connect Endpoint + `curl` | VPC B | ✅     |
 
 ---
 
@@ -147,9 +149,44 @@ Everything lives in **one template** ([`privatelink-lab.yaml`](privatelink-lab.y
 | "Automatically accept"          | `AcceptanceRequired: false` |
 | "Consumer endpoint in each VPC" | Step 5                      |
 
-### Step 5: Interface endpoint (VPC B) – coming next
+### Step 5: Interface endpoint (VPC B)
 
-### Step 6: Test with `curl` from VPC B – coming next
+- **Interface endpoint** pointing to the service name from Step 4, in **both VPC B subnets**.
+- AWS creates **one ENI per subnet (per AZ)**, each with a **private IP from VPC B**, plus DNS names:
+
+  | DNS name                                            | Type         | Use                                                           |
+  | --------------------------------------------------- | ------------ | ------------------------------------------------------------- |
+  | `vpce-xxx.vpce-svc-yyy.<region>.vpce.amazonaws.com` | **Regional** | ✅ Default. Resolves to all AZs, so it survives an AZ failure |
+  | `vpce-xxx-<az>.vpce-svc-yyy...`                     | Zonal        | Keep traffic in one AZ (e.g. avoid inter-AZ charges)          |
+
+  The ID in brackets shown in the console (e.g. `Z38GZ743OKFT7T`) is the Route 53 hosted zone ID, not part of the name.
+
+- **Security group on the endpoint:** TCP 80 from VPC B. It controls **who in VPC B** can use the endpoint. There are now two SGs on the path: one in VPC B (who can use the door) and one in VPC A (NLB → instance).
+- `PrivateDnsEnabled: false`, because no custom private DNS name was set on the endpoint service.
+- **`DependsOn: EndpointServicePermissions`.** CloudFormation builds in parallel, so if the endpoint asks to connect before the account is allowed, the request is rejected. In a real multi-account setup the order is the same: the provider grants access, then the consumer creates its endpoint.
+- **Still no route tables changed.** The endpoint IPs are inside VPC B, so the `local` route already reaches them.
+- **Interface vs Gateway endpoints:** Interface = ENIs with private IPs (any PrivateLink service). **Gateway** endpoints exist only for **S3 and DynamoDB** and work through route table entries.
+
+### Step 6: Test from VPC B
+
+- **Test EC2** in a private VPC B subnet, playing a "country account" client.
+- **EC2 Instance Connect Endpoint (EIC):** lets you SSH into a **private** instance with no public IP, no Internet Gateway and no bastion host. Access is authenticated with **IAM**. It's free.
+- Security groups: the test instance allows **SSH only from the EIC Endpoint SG**, and the EIC SG allows **SSH out only to the test instance**. A separate `SecurityGroupIngress` resource avoids a circular dependency between the two SGs.
+
+**Connect**, in either of two ways:
+
+- **Console:** EC2 → `test-client-ec2` → **Connect** → **EC2 Instance Connect** → _Connect using EC2 Instance Connect Endpoint_ → user `ec2-user`.
+- **CLI v2 only:** `aws ec2-instance-connect ssh --instance-id <TestInstanceId> --connection-type eice`
+
+**Test** (use the `EndpointDnsName` output, the regional name):
+
+```bash
+getent hosts <EndpointDnsName>                # → 10.0.1.x / 10.0.2.x (VPC B's own IPs)
+curl http://<EndpointDnsName>                 # → Hello from shared services ✅
+curl --max-time 5 http://<ServicePrivateIp>   # → times out ❌
+```
+
+The last test proves it's **not a network connection**: `10.0.1.x` inside VPC B means VPC B's own subnet, not VPC A. The consumer reaches **only the service**, and the overlapping CIDR didn't break anything.
 
 ---
 
@@ -195,6 +232,18 @@ aws ec2 describe-vpc-endpoint-service-configurations \
   --query "ServiceConfigurations[].[ServiceName,ServiceState,AcceptanceRequired]" --output table
 aws ec2 describe-vpc-endpoint-service-permissions --service-id <EndpointServiceId>
 
+# Step 5: interface endpoint state and its ENIs
+aws ec2 describe-vpc-endpoints --vpc-endpoint-ids <ConsumerEndpointId> \
+  --query "VpcEndpoints[].[State,NetworkInterfaceIds]"
+
+# Step 6: connect to the test client (CLI v2 only)
+aws ec2-instance-connect ssh --instance-id <TestInstanceId> --connection-type eice
+
+# Get just the values needed for testing
+aws cloudformation describe-stacks --stack-name privatelink-lab \
+  --query "Stacks[0].Outputs[?OutputKey=='EndpointDnsName' || OutputKey=='ServicePrivateIp'].[OutputKey,OutputValue]" \
+  --output table
+
 # Cleanup
 aws cloudformation delete-stack --stack-name privatelink-lab
 aws cloudformation wait stack-delete-complete --stack-name privatelink-lab
@@ -235,9 +284,27 @@ It's **not needed for PrivateLink to work**, because the traffic stays on the AW
 
 The certificate must match the name clients use, so in practice you pair TLS with a friendly private DNS name.
 
+**Why an EC2 Instance Connect Endpoint instead of a public subnet?**
+A public subnet needs an Internet Gateway, a public IP and SSH open to your IP, which opens VPC B to the internet. The EIC Endpoint keeps VPC B **100% private** and controls access with IAM instead of open ports.
+
 ---
 
-## 8. Well-Architected mapping
+## 8. Troubleshooting
+
+| Problem                                                                                      | Cause                                                                             | Fix                                                                                                                                                                           |
+| -------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `aws ec2-instance-connect ssh` → `Invalid choice, valid choices are: send-ssh-public-key...` | You're on **AWS CLI v1**. `ssh` / `open-tunnel` exist only in **v2**              | Connect from the console, or install v2 (`brew install awscli`, or the official AWS `.pkg`)                                                                                   |
+| `aws --version` still shows 1.x after installing v2                                          | An old v1 (installed with pip) comes first in `PATH`                              | `which -a aws` to see every copy. `head -1 <path>` shows which Python owns it. Uninstall with `<that-python> -m pip uninstall awscli --break-system-packages`, then `hash -r` |
+| `getent hosts eic-endpoint-vpc-b` returns nothing                                            | That's the **tag** of the Instance Connect Endpoint, not a DNS name               | Use the **interface endpoint's** regional DNS name (`EndpointDnsName` output)                                                                                                 |
+| Interface endpoint creation fails                                                            | Your account isn't in the **allowed principals** yet                              | Check Step 4 permissions, and keep `DependsOn: EndpointServicePermissions`                                                                                                    |
+| Endpoint stuck in `pendingAcceptance`                                                        | `AcceptanceRequired: true`                                                        | Accept the connection on the endpoint service, or set it to `false`                                                                                                           |
+| Target `unhealthy`                                                                           | The instance SG doesn't allow the NLB                                             | Allow TCP 80 from VPC A's CIDR                                                                                                                                                |
+| `curl` hangs                                                                                 | Endpoint SG doesn't allow TCP 80 from the client, or there's no target in that AZ | Check the endpoint SG, and enable cross-zone or add targets in every AZ                                                                                                       |
+| Can't connect with Instance Connect                                                          | The EIC Endpoint is still being created, or you're in the wrong Region            | Wait until it's **Available** (VPC → Endpoints), and check the Region                                                                                                         |
+
+---
+
+## 9. Well-Architected mapping
 
 | Pillar / best practice                                         | Where it shows up                                                                                                          |
 | -------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
@@ -246,35 +313,37 @@ The certificate must match the name clients use, so in practice you pair TLS wit
 | **SEC03** – Grant least privilege                              | Allowed principals = only the accounts that need the service, never `*`                                                    |
 | **SEC05-BP01** – Create network layers                         | Private subnets, no Internet Gateway                                                                                       |
 | **SEC05-BP02** – Control traffic at all layers                 | SG opens only TCP 80 from VPC A. Internal NLB. PrivateLink: only the consumer initiates, traffic stays on the AWS backbone |
-| **SEC06** – Protect compute                                    | No public IP, no SSH, no internet on the instance                                                                          |
+| **SEC06** – Protect compute                                    | No public IPs, no internet. Access through the EC2 Instance Connect Endpoint with IAM, not bastion hosts or open ports     |
 | **SEC09-BP01 / BP02** – Certificates and encryption in transit | Production: TLS on the NLB with ACM                                                                                        |
 | **REL02-BP03** – IP allocation for expansion and availability  | Subnets in 2 AZs, `/16` leaves room to grow                                                                                |
 | **REL02-BP04** – Prefer hub-and-spoke over many-to-many mesh   | One endpoint service (hub), many consumer endpoints (spokes). Peering among many VPCs is an anti-pattern                   |
-| **REL10** – Use fault isolation (multiple AZs)                 | NLB in 2 AZs. Production: targets in every AZ                                                                              |
+| **REL10** – Use fault isolation (multiple AZs)                 | NLB and endpoint ENIs in 2 AZs, regional DNS name. Production: targets in every AZ                                         |
 | **PERF05** – Use load balancing                                | NLB for layer 4, high performance, low latency                                                                             |
 | **COST** – Avoid unused resources                              | Delete the stack when finished                                                                                             |
 
 ---
 
-## 9. Exam tips
+## 10. Exam tips
 
 - **Many VPCs/accounts → one service, least overhead** → **PrivateLink (NLB + endpoint service)**.
 - **All VPCs must talk to each other** → **Transit Gateway**.
 - **Overlapping CIDRs** → PrivateLink works. Peering and Transit Gateway routing don't.
 - **PrivateLink endpoint service** → always an **NLB** (or GWLB). An option with an **ALB** as the endpoint service is wrong.
 - **Peering** is not transitive and gets heavy beyond a few VPCs.
+- **Interface endpoint** = ENIs with private IPs (PrivateLink). **Gateway endpoint** = route table entry, **only S3 and DynamoDB**.
+- **SSH to private instances without a bastion or public IP** → **EC2 Instance Connect Endpoint** (or Systems Manager Session Manager).
 - Ask yourself: **"How many connections do I have to create and maintain?"**
 
 ---
 
-## 10. Cost and cleanup
+## 11. Cost and cleanup
 
-| Resource                                         | Billing                                       |
-| ------------------------------------------------ | --------------------------------------------- |
-| VPCs, subnets, security groups, endpoint service | Free                                          |
-| EC2 `t3.micro`                                   | Per hour (Free Tier eligible on new accounts) |
-| Network Load Balancer                            | Per hour + usage                              |
-| Interface endpoint (Step 5)                      | Per hour per AZ + per GB                      |
+| Resource                                                                        | Billing                                       |
+| ------------------------------------------------------------------------------- | --------------------------------------------- |
+| VPCs, subnets, security groups, endpoint service, EC2 Instance Connect Endpoint | Free                                          |
+| 2 × EC2 `t3.micro`                                                              | Per hour (Free Tier eligible on new accounts) |
+| Network Load Balancer                                                           | Per hour + usage                              |
+| Interface endpoint                                                              | Per hour per AZ + per GB                      |
 
 ⚠️ **Delete the stack when you finish:**
 
